@@ -3,6 +3,8 @@ mod dbcn;
 mod pmu;
 mod rfnc;
 mod srst;
+mod hsm;
+mod spi;
 
 use axerrno::{AxError, AxResult};
 pub use base::BaseFunction;
@@ -11,6 +13,8 @@ pub use pmu::PmuFunction;
 pub use rfnc::RemoteFenceFunction;
 use sbi_spec;
 pub use srst::ResetFunction;
+pub use hsm::HSMFunction;
+pub use spi::IPIFunction;
 
 pub const SBI_SUCCESS: usize = 0;
 pub const SBI_ERR_FAILUER: isize = -1;
@@ -58,6 +62,10 @@ pub enum SbiMessage {
     RemoteFence(RemoteFenceFunction),
     /// The PMU Extension
     PMU(PmuFunction),
+    /// The Hart State Management Extension
+    HSM(HSMFunction),
+    /// The IPI Extension: s-mode IPI
+    SPI(IPIFunction),
 }
 
 impl SbiMessage {
@@ -76,6 +84,9 @@ impl SbiMessage {
                 RemoteFenceFunction::from_args(args).map(SbiMessage::RemoteFence)
             }
             sbi_spec::pmu::EID_PMU => PmuFunction::from_regs(args).map(SbiMessage::PMU),
+            // multi-core
+            sbi_spec::hsm::EID_HSM => HSMFunction::from_args(args).map(SbiMessage::HSM),
+            sbi_spec::spi::EID_SPI => IPIFunction::from_args(args).map(SbiMessage::SPI),
             _ => {
                 error!("args: {:?}", args);
                 error!("args[7]: {:#x}", args[7]);

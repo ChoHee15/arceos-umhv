@@ -9,7 +9,7 @@ use tock_registers::LocalRegisterCopy;
 use riscv::register::{htinst, htval, hvip, scause, sstatus, stval};
 
 use super::csrs::{traps, RiscvCsrTrait, CSR};
-use super::sbi::{BaseFunction, PmuFunction, RemoteFenceFunction, SbiMessage};
+use super::sbi::{BaseFunction, HSMFunction, IPIFunction, PmuFunction, RemoteFenceFunction, SbiMessage};
 use crate::{AxVMHal, GuestPhysAddr, GuestVirtAddr, HostPhysAddr};
 use axvcpu::AxArchVCpuExitReason;
 
@@ -17,7 +17,7 @@ use super::csrs::defs::hstatus;
 use super::regs::{GeneralPurposeRegisters, GprIndex};
 use super::vmexit::VmExitInfo;
 use super::PerCpu;
-use sbi_rt::{pmu_counter_get_info, pmu_counter_stop};
+use sbi_rt::{pmu_counter_get_info, pmu_counter_stop, SbiRet};
 
 /// Hypervisor GPR and CSR state which must be saved/restored when entering/exiting virtualization.
 #[derive(Default)]
@@ -202,8 +202,11 @@ extern "C" {
     fn _run_guest(state: *mut VmCpuRegisters);
 }
 
+#[derive(Default)]
+#[derive(Clone, Copy)]
 pub enum VmCpuStatus {
     /// The vCPU is not powered on.
+    #[default]
     PoweredOff,
     /// The vCPU is available to be run.
     Runnable,
@@ -222,6 +225,7 @@ pub struct VCpu<H: AxVMHal> {
     // gpt: G,
     // pub guest: Arc<Guest>,
     marker: PhantomData<H>,
+    // status: VmCpuStatus,
 }
 
 impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
@@ -252,6 +256,7 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
         Ok(Self {
             regs: regs,
             marker: core::marker::PhantomData,
+            // status: VmCpuStatus::PoweredOff,
         })
     }
 
@@ -278,6 +283,7 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
     }
 
     fn run(&mut self) -> AxResult<AxArchVCpuExitReason> {
+        // self.sync();
         let regs = &mut self.regs;
         unsafe {
             // Safe to run the guest as it only touches memory assigned to it by being owned
@@ -289,6 +295,13 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
 
     fn bind(&mut self) -> AxResult {
         // unimplemented!()
+        let mut hstatus = LocalRegisterCopy::<usize, hstatus::Register>::new(
+            riscv::register::hstatus::read().bits(),
+        );
+        hstatus.modify(hstatus::spv::Supervisor);
+        // Set SPVP bit in order to accessing VS-mode memory from HS-mode.
+        hstatus.modify(hstatus::spvp::Supervisor);
+        CSR.hstatus.write_value(hstatus.get());
         Ok(())
     }
 
@@ -317,6 +330,11 @@ impl<H: AxVMHal> VCpu<H> {
     /// Gets the vCPU's registers.
     pub fn regs(&mut self) -> &mut VmCpuRegisters {
         &mut self.regs
+    }
+
+    /// Set vCPU's spec, as same as set_entry
+    pub fn set_spec(&mut self, spec: usize){
+        self.regs.guest_regs.sepc = spec;
     }
 }
 
@@ -362,6 +380,31 @@ impl<H: AxVMHal> VCpu<H> {
                         SbiMessage::PMU(pmu) => {
                             self.handle_pmu_function(pmu).unwrap();
                         }
+                        SbiMessage::HSM(hsm) => {
+                            // debug!("vcpu{} HSM calling !", vcpu_id);
+                            debug!("vcpu HSM calling !");
+                            match hsm {
+                                HSMFunction::HART_START{
+                                    hartid,
+                                    start_addr,
+                                    opaque,
+                                } => {
+                                    let sbi_ret = SbiRet::success(0);
+                                    self.set_gpr(GprIndex::A0, sbi_ret.error);
+                                    self.set_gpr(GprIndex::A1, sbi_ret.value);
+                                    self.advance_pc(4);
+                                    return Ok(AxArchVCpuExitReason::RV_START { hartid: hartid, start_addr: start_addr, opaque: opaque });
+                                }
+                                _ => {
+                                    panic!("other HSM function");
+                                }
+                            }
+                            // self.handle_hsm_function(hsm).unwrap();
+                        }
+                        SbiMessage::SPI(spi) => {
+                            // trace!("vcpu{} SPI calling !", vcpu_id);
+                            self.handle_spi_function(spi).unwrap();
+                        }
                         _ => todo!(),
                     }
                     self.advance_pc(4);
@@ -388,10 +431,17 @@ impl<H: AxVMHal> VCpu<H> {
                 let fault_addr = self.regs.trap_csrs.htval << 2 | self.regs.trap_csrs.stval & 0x3;
                 Ok(AxArchVCpuExitReason::NestedPageFault { addr: fault_addr })
             }
+            Trap::Interrupt(Interrupt::SupervisorSoft) => {
+                // TODO remove lagacy
+                sbi_rt::legacy::clear_ipi();
+                CSR.hvip
+                    .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_SOFT);
+                Ok(AxArchVCpuExitReason::Nothing)
+            }
             _ => {
                 panic!(
-                    "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}",
-                    scause.cause(),
+                    "Unhandled trap: {:?}|{:#x}, sepc: {:#x}, stval: {:#x}",
+                    scause.cause(), scause.bits(), 
                     self.regs.guest_regs.sepc,
                     self.regs.trap_csrs.stval
                 );
@@ -487,6 +537,70 @@ impl<H: AxVMHal> VCpu<H> {
                     counter_mask as usize,
                     stop_flags as usize,
                 );
+                self.set_gpr(GprIndex::A0, sbi_ret.error);
+                self.set_gpr(GprIndex::A1, sbi_ret.value);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_hsm_function(&mut self, hsm: HSMFunction) -> AxResult<()> {
+        debug!("---handling hsm function!");
+        match hsm {
+            HSMFunction::HART_START{
+                hartid,
+                start_addr,
+                opaque,
+            } => {
+                debug!("---guest hsm start:({}, {:#x}, {:#x})", hartid, start_addr, opaque);
+
+                panic!("nooo");
+
+                // let target_vcpu = self.vcpus.get_vcpu(hartid).unwrap();
+
+                // target_vcpu.set_gpr(GprIndex::A0, hartid);
+                // target_vcpu.set_gpr(GprIndex::A1, opaque);
+                // target_vcpu.set_spec(start_addr);
+
+                // target_vcpu.set_status(VmCpuStatus::Runnable);
+                // debug!("---guest hsm start set runnable {}", hartid);
+
+
+                let sbi_ret = SbiRet::success(0);
+                self.set_gpr(GprIndex::A0, sbi_ret.error);
+                self.set_gpr(GprIndex::A1, sbi_ret.value);
+                // debug!("---guest hsm start return {}", hartid);
+            }
+            HSMFunction::HART_STOP => {
+                panic!("TODO");
+            }
+            HSMFunction::HART_GET_STATUS { 
+                hartid: _ 
+            } =>{
+                panic!("TODO");
+            }
+            HSMFunction::HART_SUSPEND { 
+                suspend_type: _, 
+                resume_addr: _, 
+                opaque: _ 
+            } => {
+                panic!("unknown HSMFunction");
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_spi_function(&mut self, spi: IPIFunction) -> AxResult<()> {
+        // debug!("---handling spi function!");
+        match spi {
+            IPIFunction::SEND_IPI{
+                hart_mask,
+                hart_mask_base, 
+            } => {
+                trace!("---guest send ipi:({:#x}, {:#x})", hart_mask, hart_mask_base);
+
+                let sbi_ret = sbi_rt::send_ipi(hart_mask, hart_mask_base);
+
                 self.set_gpr(GprIndex::A0, sbi_ret.error);
                 self.set_gpr(GprIndex::A1, sbi_ret.value);
             }

@@ -2,6 +2,8 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use axerrno::{ax_err, ax_err_type, AxResult};
+use axvcpu::AxArchVCpu;
+use axvcpu::VCpuState;
 
 use crate::arch::AxArchDeviceList;
 use crate::arch::AxArchVCpuImpl;
@@ -109,16 +111,73 @@ impl<H: AxVMHal> AxVM<H> {
     }
 
     pub fn run_vcpu(&self, vcpu_id: usize) -> AxResult {
+
         let vcpu = self
             .vcpu(vcpu_id)
             .ok_or_else(|| ax_err_type!(InvalidInput, "Invalid vcpu_id"))?;
+
+        info!("set ept to {:#x}", self.ept_root());
+        vcpu.get_arch_vcpu().set_ept_root(self.ept_root()).unwrap();
+
         vcpu.bind()?;
+
+        info!("vcpu{} bind!", vcpu_id);
+
+        self.sync_vcpu(vcpu_id).unwrap();
+
+        // if vcpu_id == 0 {
+        //     let arch_vcpu = vcpu.get_arch_vcpu();
+        //     arch_vcpu.set_runnable();
+        // }
+
         loop {
             // todo: device access
             let exit_reason = vcpu.run()?;
-            let device_list = self.get_device_list();
-            device_list.vmexit_handler(vcpu.get_arch_vcpu(), exit_reason);
+
+            match exit_reason {
+                axvcpu::AxArchVCpuExitReason::RV_START { hartid, start_addr, opaque } => {
+                    error!("exit_reason: RV_START");
+                    let target = self
+                        .vcpu(hartid)
+                        .ok_or_else(|| ax_err_type!(InvalidInput, "Invalid vcpu_id"))?;
+                    let device_list = self.get_device_list();
+                    device_list.vmexit_handler(target.get_arch_vcpu(), exit_reason);
+                    error!("eee");
+                    target.transition_state(VCpuState::Free, VCpuState::Ready).unwrap();
+                    error!("yyy");
+                }
+                _ => {
+                    let device_list = self.get_device_list();
+                    device_list.vmexit_handler(vcpu.get_arch_vcpu(), exit_reason);
+                }
+            }
+
+            // let device_list = self.get_device_list();
+            // device_list.vmexit_handler(vcpu.get_arch_vcpu(), exit_reason);
         }
         vcpu.unbind()
+    }
+
+    pub fn sync_vcpu(&self, vcpu_id: usize) -> AxResult {
+        let target_vcpu = self
+            .vcpu(vcpu_id)
+            .ok_or_else(|| ax_err_type!(InvalidInput, "Invalid vcpu_id"))?;
+
+        loop {
+            // TODO: 这volatile吗？需要测试dubug/release mode的效果
+            let state = target_vcpu.state();
+            match state {
+                VCpuState::Ready =>{
+                    debug!("VCPU{} ready to run!!!", vcpu_id);
+                    return Ok(());
+                }
+                VCpuState::Running => {
+                    panic!("wtf??");
+                }
+                _ => {
+                    core::hint::spin_loop();
+                }
+            }
+        }
     }
 }

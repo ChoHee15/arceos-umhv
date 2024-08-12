@@ -187,9 +187,11 @@ debug: build
 	sleep 1
 	$(GDB) $(OUT_ELF) \
 	  -ex 'target remote localhost:1234' \
-	  -ex 'b rust_entry' \
-	  -ex 'continue' \
-	  -ex 'disp /16i $$pc'
+	  -ex 'b rust_entry'\
+    -ex 'set riscv use-compressed-breakpoints yes'
+
+	  # -ex 'continue' \
+	  # -ex 'disp /16i $$pc'
 
 clippy:
 ifeq ($(origin ARCH), command line)

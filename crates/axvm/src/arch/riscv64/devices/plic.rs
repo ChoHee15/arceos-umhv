@@ -46,7 +46,7 @@ impl PlicState {
     }
 
     pub fn write_u32(&mut self, addr: usize, val: u32) {
-        // debug!("PLIC write@{:#x} -> {:#x}", addr, val);
+        debug!("PLIC write@{:#x} -> {:#x}", addr, val);
         let offset = addr.wrapping_sub(self.base);
         // threshold/claim/complete
         if (0x200000..0x200000 + 0x1000 * MAX_CONTEXTS).contains(&offset) {
